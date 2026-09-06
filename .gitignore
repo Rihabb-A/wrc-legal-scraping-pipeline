@@ -1,0 +1,33 @@
+# Python virtual environment
+.venv/
+venv/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets - never commit the real .env, only .env.example
+.env
+
+# Scrapy runtime files
+.scrapy/
+
+# Local scraped output and logs (data belongs in MinIO/MongoDB, not in Git)
+data/
+output/
+*.jsonl
+sample.json
+
+# Dagster local state
+tmp*/
+dagster_home/
+
+# Playwright MCP scratch output from website reconnaissance
+.playwright-mcp/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,3 @@
+# Phase 0 dependencies only. More are added as each phase of the project needs them.
+scrapy
+python-dotenv
