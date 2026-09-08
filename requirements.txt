@@ -2,5 +2,9 @@
 scrapy
 python-dotenv
 
+# Storage clients
+pymongo
+minio
+
 # Testing
 pytest

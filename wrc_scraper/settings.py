@@ -7,6 +7,8 @@
 #     https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
 #     https://docs.scrapy.org/en/latest/topics/spider-middleware.html
 
+from common.config import env
+
 BOT_NAME = "wrc_scraper"
 
 SPIDER_MODULES = ["wrc_scraper.spiders"]
@@ -58,12 +60,21 @@ DOWNLOAD_DELAY = 1
 
 # Configure item pipelines
 # See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
+# Order matters: files are stored first, so the metadata record can say
+# where the file actually ended up.
 ITEM_PIPELINES = {
     "wrc_scraper.pipelines.LandingFilePipeline": 300,
+    "wrc_scraper.pipelines.MongoPipeline": 400,
 }
 
 # Where raw documents are written. Replaced by a MinIO bucket in a later step.
-LANDING_DIR = "data/landing"
+LANDING_DIR = env("LANDING_DIR", "data/landing")
+
+# --- MongoDB, from .env so nothing here is hardcoded ---
+MONGO_URI = env("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB = env("MONGO_DB", "wrc")
+MONGO_LANDING_COLLECTION = env("MONGO_LANDING_COLLECTION", "landing_documents")
+MONGO_CURATED_COLLECTION = env("MONGO_CURATED_COLLECTION", "curated_documents")
 
 # Enable and configure the AutoThrottle extension (disabled by default)
 # See https://docs.scrapy.org/en/latest/topics/autothrottle.html
