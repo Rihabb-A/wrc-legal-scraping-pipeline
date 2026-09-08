@@ -1,33 +1,31 @@
 """Spider for Workplace Relations decisions.
 
-Step 5 (current): extract every record in a search range, across all pages,
-and reconcile the number found against the number scraped.
-Later steps add partitions, all four bodies, and storage.
+Step 7 (current): take a start/end date, split it into partitions, and search
+every body in every partition. Each record is tagged with the body and
+partition_date it came from.
+
+Run it with:
+
+    scrapy crawl decisions -a start_date=2025-07-01 -a end_date=2025-07-31
+
+Later steps add document downloads and storage.
 """
 
 import math
-import re
 from datetime import datetime
 
 import scrapy
 from w3lib.url import add_or_replace_parameter
 
-# The search page reports its own total, e.g. "Shows 1 to 10 of 32 results".
-# The site renders this with newlines and doubled spaces, so we collapse
-# whitespace before matching.
-RESULT_COUNT_RE = re.compile(r"Shows\s+\d+\s+to\s+\d+\s+of\s+(\d+)\s+results")
-
-# The site displays dates as dd/mm/yyyy
-SITE_DATE_FORMAT = "%d/%m/%Y"
-
-# Results per page is fixed at 10. Recon tested pageSize, size, perPage,
-# pagesize, resultsPerPage and rows - the site ignores all of them.
-PAGE_SIZE = 10
-
-# Shown when a search legitimately matches nothing, and also when pageNumber
-# runs past the last page. Distinct from div.searchhead being absent entirely,
-# which means the request itself was malformed (docs/recon.md §3).
-NO_RESULTS_TEXT = "There are no search results"
+from common.partitioning import MONTHLY, generate_partitions
+from wrc_scraper.constants import (
+    NO_RESULTS_TEXT,
+    PAGE_SIZE,
+    RESULT_COUNT_RE,
+    SITE_DATE_FORMAT,
+    build_search_url,
+    resolve_bodies,
+)
 
 
 class DecisionsSpider(scrapy.Spider):
@@ -36,54 +34,103 @@ class DecisionsSpider(scrapy.Spider):
     name = "decisions"
     allowed_domains = ["workplacerelations.ie"]
 
-    # One hard-coded URL for now: Labour Court, July 2025.
-    # Recon verified this range returns exactly 32 results across 4 pages.
-    start_urls = [
-        "https://www.workplacerelations.ie/en/search/"
-        "?decisions=1&body=3&from=2025-07-01&to=2025-07-31&pageNumber=1"
-    ]
+    def __init__(
+        self,
+        start_date=None,
+        end_date=None,
+        partition_size=MONTHLY,
+        bodies=None,
+        *args,
+        **kwargs,
+    ):
+        """Validate the run's inputs before a single request is made.
 
-    def __init__(self, *args, **kwargs):
+        Spider arguments arrive as strings from the command line, e.g.
+        ``-a start_date=2025-07-01``. Everything is validated here so that a
+        bad input fails immediately rather than halfway through a long crawl.
+        """
         super().__init__(*args, **kwargs)
-        # Reconciliation counters: the site tells us how many records exist,
-        # so "found" is a known number rather than a guess. Anything missing
-        # at the end of the run must be explained, not silently dropped.
-        self.records_found = 0
-        self.records_scraped = 0
-        self.failed_pages = []
 
-    def parse(self, response, is_first_page=True):
+        if not start_date or not end_date:
+            raise ValueError(
+                "start_date and end_date are required, e.g. "
+                "scrapy crawl decisions -a start_date=2025-07-01 -a end_date=2025-07-31"
+            )
+
+        # Both of these raise on bad input rather than quietly producing an
+        # empty run that would look like a success.
+        self.partitions = generate_partitions(start_date, end_date, partition_size)
+        self.bodies = resolve_bodies(bodies)
+
+        # Reconciliation is tracked per slice - one partition, one body - so a
+        # shortfall can be traced to the exact search that lost records,
+        # instead of only showing up as a wrong grand total.
+        self.slice_stats = {}
+        self.failures = []
+
+        self.logger.info(
+            "Run covers %s partitions x %s bodies = %s searches (%s..%s)",
+            len(self.partitions),
+            len(self.bodies),
+            len(self.partitions) * len(self.bodies),
+            self.partitions[0].start.isoformat(),
+            self.partitions[-1].end.isoformat(),
+        )
+
+    async def start(self):
+        """Issue the first search page for every partition/body combination.
+
+        All combinations are scheduled up front rather than run one after
+        another. They are independent, so this lets the downloader work on
+        several at once - which is the point of partitioning.
+        """
+        for partition in self.partitions:
+            for body_name, body_id in self.bodies.items():
+                yield scrapy.Request(
+                    build_search_url(body_id, partition.start, partition.end),
+                    callback=self.parse,
+                    cb_kwargs={
+                        "partition_date": partition.partition_date,
+                        "body": body_name,
+                    },
+                )
+
+    def parse(self, response, partition_date, body, is_first_page=True):
         """Handle a search results page.
 
-        On the first page of a range we also schedule every remaining page.
+        On the first page of a slice we also schedule its remaining pages.
         """
+        slice_key = (partition_date, body)
+        stats = self.slice_stats.setdefault(
+            slice_key, {"found": 0, "scraped": 0, "pages": 0}
+        )
+        stats["pages"] += 1
+
         # div.searchhead is the site's own record count. It is also our only
         # reliable success signal: this site returns HTTP 200 even for broken
         # requests, so the status code alone proves nothing (docs/recon.md §3).
-        #Shows 1 to 10 of 32 results
         searchhead = response.css("div.searchhead::text").get()
 
         if searchhead is None:
             # Not "zero results" - the request was malformed or the response
             # is broken. Record it so the end-of-run summary cannot silently
             # under-report.
-            self.logger.error("No div.searchhead: %s", response.url)
-            self.failed_pages.append(
-                {"url": response.url, "reason": "missing_searchhead"}
-            )
+            self.record_failure(response.url, partition_date, body, "missing_searchhead")
             return
 
         searchhead = " ".join(searchhead.split())
 
         if NO_RESULTS_TEXT in searchhead:
-            self.logger.info("No results for %s", response.url)
+            self.logger.info("No results: partition=%s body=%s", partition_date, body)
             return
 
         match = RESULT_COUNT_RE.search(searchhead)
         if match is None:
-            self.logger.error("Unrecognised searchhead %r at %s", searchhead, response.url)
-            self.failed_pages.append(
-                {"url": response.url, "reason": "unparseable_searchhead"}
+            self.record_failure(
+                response.url,
+                partition_date,
+                body,
+                f"unparseable_searchhead:{searchhead!r}",
             )
             return
 
@@ -91,50 +138,87 @@ class DecisionsSpider(scrapy.Spider):
         cards = response.css("li.each-item")
 
         if not cards:
-            self.logger.error("Reported %s results but no cards: %s", total, response.url)
-            self.failed_pages.append({"url": response.url, "reason": "no_cards"})
+            self.record_failure(
+                response.url, partition_date, body, f"no_cards_but_reported_{total}"
+            )
             return
 
         for card in cards:
-            self.records_scraped += 1
-            yield self.parse_card(card, response)
+            stats["scraped"] += 1
+            yield self.parse_card(card, response, partition_date, body)
 
-        #Pages 2, 3, 4 should only extract their cards. 
-        #They should not calculate pagination again.
-        #Only page 1 does that.
         if not is_first_page:
             return
 
         # First page only: the total is now known, so every remaining page can
         # be requested immediately. Following "next page" links instead would
-        # serialise the whole range - page N must be parsed before N+1 is even
+        # serialise the whole slice - page N must be parsed before N+1 is even
         # known - and search pages take 2-30s each (docs/recon.md §7).
-        self.records_found += total
-        #calculate nb of page
-        last_page = math.ceil(total / PAGE_SIZE) 
+        stats["found"] = total
+        last_page = math.ceil(total / PAGE_SIZE)
         self.logger.info(
-            "Range has %s records across %s pages: %s", total, last_page, response.url
+            "partition=%s body=%s found=%s pages=%s",
+            partition_date,
+            body,
+            total,
+            last_page,
         )
 
         for page in range(2, last_page + 1):
             yield response.follow(
                 add_or_replace_parameter(response.url, "pageNumber", str(page)),
                 callback=self.parse,
-                cb_kwargs={"is_first_page": False},
+                cb_kwargs={
+                    "partition_date": partition_date,
+                    "body": body,
+                    "is_first_page": False,
+                },
             )
+
+    def record_failure(self, url, partition_date, body, reason):
+        """Log a failure and keep it for the end-of-run summary."""
+        self.logger.error(
+            "FAILED partition=%s body=%s reason=%s url=%s",
+            partition_date,
+            body,
+            reason,
+            url,
+        )
+        self.failures.append(
+            {
+                "url": url,
+                "partition_date": partition_date,
+                "body": body,
+                "reason": reason,
+            }
+        )
 
     def closed(self, reason):
         """Log the end-of-run reconciliation summary."""
+        found = sum(s["found"] for s in self.slice_stats.values())
+        scraped = sum(s["scraped"] for s in self.slice_stats.values())
+
+        # Any slice whose count does not add up is named explicitly, so a
+        # shortfall points at the search that caused it.
+        mismatched = {
+            f"{partition_date}/{body}": stats
+            for (partition_date, body), stats in sorted(self.slice_stats.items())
+            if stats["found"] != stats["scraped"]
+        }
+
         self.logger.info(
-            "RUN SUMMARY: found=%s scraped=%s missing=%s failed_pages=%s reason=%s",
-            self.records_found,
-            self.records_scraped,
-            self.records_found - self.records_scraped,
-            self.failed_pages,
+            "RUN SUMMARY: found=%s scraped=%s missing=%s slices=%s "
+            "failures=%s mismatched=%s reason=%s",
+            found,
+            scraped,
+            found - scraped,
+            len(self.slice_stats),
+            len(self.failures),
+            mismatched or "none",
             reason,
         )
 
-    def parse_card(self, card, response):
+    def parse_card(self, card, response, partition_date, body):
         """Turn one ``li.each-item`` result into a metadata dict.
 
         Selecting the card first, then reading fields *within* it, keeps every
@@ -153,6 +237,10 @@ class DecisionsSpider(scrapy.Spider):
             # The href is relative ("/en/cases/..."), so urljoin turns it into
             # a full URL using the current page as the base.
             "doc_url": response.urljoin(card.css("div.link a::attr(href)").get()),
+            # Which search produced this record. Never derived from the URL
+            # path: PWD2528 is published 31 July but lives under /august/.
+            "body": body,
+            "partition_date": partition_date,
         }
 
     @staticmethod
@@ -184,7 +272,7 @@ class DecisionsSpider(scrapy.Spider):
         if not value:
             return None
         try:
-            #convert first from string to date format then to 2025-07-31
+            #conv
             return datetime.strptime(value, SITE_DATE_FORMAT).date().isoformat()
         except ValueError:
             self.logger.warning("Unparseable published_date %r", value)

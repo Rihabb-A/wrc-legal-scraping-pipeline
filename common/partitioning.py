@@ -15,8 +15,9 @@ from calendar import monthrange
 from datetime import date, datetime, timedelta
 from typing import Iterable, NamedTuple, Union
 
-DateLike = Union[date, datetime, str]
+DateLike = Union[date, datetime, str] #accepted date types
 
+#partition size
 DAILY = "daily"
 WEEKLY = "weekly"
 MONTHLY = "monthly"
@@ -36,11 +37,12 @@ class Partition(NamedTuple):
             this slice, e.g. ``"2025-07"``. Used to group records, to name
             object-storage paths, and as the Dagster partition key.
     """
-
+    #start, end and label
     start: date
     end: date
     partition_date: str
 
+    #dict useful for logging
     def as_dict(self) -> dict:
         """ISO-string form, for logging and for storing on a record."""
         return {
@@ -49,7 +51,7 @@ class Partition(NamedTuple):
             "partition_date": self.partition_date,
         }
 
-
+#
 def to_date(value: DateLike) -> date:
     """Coerce a date, datetime or ISO string into a plain ``date``.
 
@@ -148,11 +150,13 @@ def generate_partitions(
         raise ValueError(f"start_date {start.isoformat()} is after end_date {end.isoformat()}")
 
     partitions: list[Partition] = []
+    #Start at the requested date, find the end of the current period, create the partition, 
+    #move to the next day, and repeat until the end date.
     cursor = start
     while cursor <= end:
         # Clip to the caller's range so we never scrape outside it.
         period_end = min(_period_end(cursor, size), end)
-        partitions.append(Partition(cursor, period_end, _label(cursor, size)))
+        partitions.append(Partition(cursor, period_end, _label(cursor, size))) #prevent scrapping outside periode range
         # The next partition starts the day after this one ends. Because both
         # ends are inclusive, this is what guarantees no gaps and no overlaps.
         cursor = period_end + timedelta(days=1)
