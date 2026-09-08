@@ -58,9 +58,12 @@ DOWNLOAD_DELAY = 1
 
 # Configure item pipelines
 # See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
-#ITEM_PIPELINES = {
-#    "wrc_scraper.pipelines.WrcScraperPipeline": 300,
-#}
+ITEM_PIPELINES = {
+    "wrc_scraper.pipelines.LandingFilePipeline": 300,
+}
+
+# Where raw documents are written. Replaced by a MinIO bucket in a later step.
+LANDING_DIR = "data/landing"
 
 # Enable and configure the AutoThrottle extension (disabled by default)
 # See https://docs.scrapy.org/en/latest/topics/autothrottle.html

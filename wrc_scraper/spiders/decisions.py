@@ -1,8 +1,8 @@
 """Spider for Workplace Relations decisions.
 
-Step 7 (current): take a start/end date, split it into partitions, and search
-every body in every partition. Each record is tagged with the body and
-partition_date it came from.
+Step 8 (current): follow every document link, work out whether the response
+is HTML or a binary document, and hand the raw bytes to the landing
+pipeline. Nothing is cleaned or rewritten at this stage.
 
 Run it with:
 
@@ -15,8 +15,10 @@ import math
 from datetime import datetime
 
 import scrapy
+from scrapy.spidermiddlewares.httperror import HttpError
 from w3lib.url import add_or_replace_parameter
 
+from common.filetypes import UNKNOWN, detect_file_type, is_binary
 from common.partitioning import MONTHLY, generate_partitions
 from wrc_scraper.constants import (
     NO_RESULTS_TEXT,
@@ -100,9 +102,8 @@ class DecisionsSpider(scrapy.Spider):
 
         On the first page of a slice we also schedule its remaining pages.
         """
-        slice_key = (partition_date, body)
         stats = self.slice_stats.setdefault(
-            slice_key, {"found": 0, "scraped": 0, "pages": 0}
+            (partition_date, body), self.new_stats()
         )
         stats["pages"] += 1
 
@@ -144,8 +145,28 @@ class DecisionsSpider(scrapy.Spider):
             return
 
         for card in cards:
-            stats["scraped"] += 1
-            yield self.parse_card(card, response, partition_date, body)
+            record = self.parse_card(card, response, partition_date, body)
+            stats["listed"] += 1
+
+            if not record["doc_url"]:
+                stats["failed"] += 1
+                self.record_failure(
+                    response.url, partition_date, body, "no_doc_url",
+                    identifier=record["identifier"],
+                )
+                continue
+
+            yield response.follow(
+                record["doc_url"],
+                callback=self.parse_document,
+                errback=self.handle_download_error,
+                cb_kwargs={"record": record},
+                # Two listings can point at the same document - the same case
+                # can appear under more than one body. Filtering those out
+                # would make a listed record vanish with no explanation, so
+                # each listing is downloaded and accounted for on its own.
+                dont_filter=True,
+            )
 
         if not is_first_page:
             return
@@ -175,13 +196,97 @@ class DecisionsSpider(scrapy.Spider):
                 },
             )
 
-    def record_failure(self, url, partition_date, body, reason):
-        """Log a failure and keep it for the end-of-run summary."""
-        self.logger.error(
-            "FAILED partition=%s body=%s reason=%s url=%s",
+    @staticmethod
+    def new_stats():
+        """Counters for one partition/body slice.
+
+        found    - what the site says exists
+        listed   - result cards we parsed out of the listing
+        downloaded - documents actually retrieved
+        failed   - documents we could not retrieve, each logged with a reason
+        """
+        return {"found": 0, "listed": 0, "downloaded": 0, "failed": 0, "pages": 0}
+
+    def parse_document(self, response, record):
+        """Handle the decision document itself.
+
+        The bytes are passed through untouched. HTML is not cleaned here:
+        the landing zone keeps exactly what the server sent, and cleaning
+        happens later in the transformation stage so the raw copy is always
+        available to re-process.
+        """
+        partition_date, body = record["partition_date"], record["body"]
+        stats = self.slice_stats.setdefault((partition_date, body), self.new_stats())
+
+        content_type = response.headers.get("Content-Type", b"").decode(
+            "ascii", "replace"
+        )
+        # The header describes what the server actually sent, so it wins over
+        # the URL extension.
+        file_type = detect_file_type(content_type, response.url)
+
+        if file_type == UNKNOWN:
+            # Still stored - we simply cannot label it, and a silent guess
+            # would be worse than an honest "unknown".
+            self.logger.warning(
+                "Unknown file type: identifier=%s content_type=%r url=%s",
+                record["identifier"],
+                content_type,
+                response.url,
+            )
+
+        stats["downloaded"] += 1
+
+        yield {
+            **record,
+            "file_type": file_type,
+            "content_type": content_type,
+            "is_binary": is_binary(file_type),
+            "http_status": response.status,
+            # Consumed and removed by LandingFilePipeline.
+            "file_bytes": response.body,
+        }
+
+    def handle_download_error(self, failure):
+        """Account for a document that could not be downloaded.
+
+        Reached only after Scrapy has exhausted its retries, so this is a
+        final failure rather than a transient one.
+        """
+        record = failure.request.cb_kwargs.get("record", {})
+        partition_date = record.get("partition_date")
+        body = record.get("body")
+        stats = self.slice_stats.setdefault((partition_date, body), self.new_stats())
+        stats["failed"] += 1
+
+        if failure.check(HttpError):
+            status = failure.value.response.status
+            reason = f"http_{status}"
+        else:
+            # DNS failure, timeout, connection reset, and so on.
+            status = None
+            reason = type(failure.value).__name__
+
+        self.record_failure(
+            failure.request.url,
             partition_date,
             body,
             reason,
+            identifier=record.get("identifier"),
+            status_code=status,
+        )
+
+    def record_failure(
+        self, url, partition_date, body, reason, identifier=None, status_code=None
+    ):
+        """Log a failure and keep it for the end-of-run summary."""
+        self.logger.error(
+            "FAILED partition=%s body=%s identifier=%s reason=%s status=%s url=%s",
+            partition_date,
+            body,
+            identifier,
+            reason,
+            status_code,
             url,
         )
         self.failures.append(
@@ -189,31 +294,40 @@ class DecisionsSpider(scrapy.Spider):
                 "url": url,
                 "partition_date": partition_date,
                 "body": body,
+                "identifier": identifier,
                 "reason": reason,
+                "status_code": status_code,
             }
         )
 
     def closed(self, reason):
         """Log the end-of-run reconciliation summary."""
-        found = sum(s["found"] for s in self.slice_stats.values())
-        scraped = sum(s["scraped"] for s in self.slice_stats.values())
+        totals = {
+            key: sum(s[key] for s in self.slice_stats.values())
+            for key in ("found", "listed", "downloaded", "failed")
+        }
 
-        # Any slice whose count does not add up is named explicitly, so a
-        # shortfall points at the search that caused it.
+        # The run is only fully accounted for when every record the site
+        # reported was either downloaded or explicitly failed.
+        unaccounted = totals["found"] - totals["downloaded"] - totals["failed"]
+
+        # Any slice that does not add up is named, so a shortfall points at
+        # the exact search that caused it rather than only a wrong total.
         mismatched = {
             f"{partition_date}/{body}": stats
             for (partition_date, body), stats in sorted(self.slice_stats.items())
-            if stats["found"] != stats["scraped"]
+            if stats["found"] != stats["downloaded"] + stats["failed"]
         }
 
         self.logger.info(
-            "RUN SUMMARY: found=%s scraped=%s missing=%s slices=%s "
-            "failures=%s mismatched=%s reason=%s",
-            found,
-            scraped,
-            found - scraped,
+            "RUN SUMMARY: found=%s listed=%s downloaded=%s failed=%s "
+            "unaccounted=%s slices=%s mismatched=%s reason=%s",
+            totals["found"],
+            totals["listed"],
+            totals["downloaded"],
+            totals["failed"],
+            unaccounted,
             len(self.slice_stats),
-            len(self.failures),
             mismatched or "none",
             reason,
         )
