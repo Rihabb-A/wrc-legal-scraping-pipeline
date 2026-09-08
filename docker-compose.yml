@@ -1,0 +1,92 @@
+# Local infrastructure for the WRC pipeline.
+#
+#   docker compose up -d      start MongoDB and MinIO
+#   docker compose ps         check they are healthy
+#   docker compose down       stop them (data is kept)
+#   docker compose down -v    stop them and delete all data
+#
+# Every value below comes from .env, with a development default so the stack
+# also starts on a clean checkout. Copy .env.example to .env to change them.
+
+services:
+  # ---------------------------------------------------------------------
+  # MongoDB - metadata about each document
+  # ---------------------------------------------------------------------
+  mongo:
+    image: mongo:7
+    container_name: wrc-mongo
+    restart: unless-stopped
+    ports:
+      # host:container. Only the host port is configurable; inside the compose
+      # network other services always reach it on 27017.
+      - "${MONGO_PORT:-27017}:27017"
+    environment:
+      MONGO_INITDB_DATABASE: ${MONGO_DB:-wrc}
+    volumes:
+      # A named volume, so metadata survives "docker compose down" and any
+      # container rebuild. Without it the database would live inside the
+      # container's writable layer and vanish with the container.
+      - mongo_data:/data/db
+    healthcheck:
+      # "Running" is not the same as "ready to accept queries". Other services
+      # and our own scripts wait on this before connecting.
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------
+  # MinIO - S3-compatible object storage for the document files
+  # ---------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: wrc-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_PORT:-9000}:9000"           # S3 API, used by the pipeline
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"   # Web console, for humans
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------
+  # One-shot: create the buckets, then exit
+  # ---------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    container_name: wrc-minio-init
+    depends_on:
+      minio:
+        # Wait for MinIO to be genuinely ready, not merely started, otherwise
+        # the first mc command races the server and fails.
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_LANDING_BUCKET: ${MINIO_LANDING_BUCKET:-wrc-landing}
+      MINIO_CURATED_BUCKET: ${MINIO_CURATED_BUCKET:-wrc-curated}
+    # $$ escapes to a literal $ so the shell inside the container expands it,
+    # not Compose. Every command is idempotent, so re-running is harmless.
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ACCESS_KEY $$MINIO_SECRET_KEY &&
+      mc mb --ignore-existing local/$$MINIO_LANDING_BUCKET &&
+      mc mb --ignore-existing local/$$MINIO_CURATED_BUCKET &&
+      mc version enable local/$$MINIO_LANDING_BUCKET &&
+      echo '--- buckets ready ---' &&
+      mc ls local
+      "
+
+volumes:
+  mongo_data:
+  minio_data:
