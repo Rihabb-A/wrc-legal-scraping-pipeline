@@ -5,46 +5,64 @@ for one thing only - reading the website. Swapping local disk for MinIO in a
 later step is then a change to this file alone.
 """
 
-from pathlib import Path
-
 from itemadapter import ItemAdapter
 from scrapy.exceptions import DropItem
 
 from common.paths import landing_key
+from storage.minio import MinioStore, S3Error
 from storage.mongo import MongoStore, PyMongoError
 
 
-class LandingFilePipeline:
-    """Write each downloaded document to the landing zone.
+class LandingObjectPipeline:
+    """Upload each downloaded document to the landing bucket in MinIO.
 
-    Interim implementation: writes to the local filesystem. A later step
-    replaces the write with an upload to MinIO, keeping the same object key
-    so nothing else has to change.
+    The object key is the same one computed before, so moving from local
+    disk to object storage changed where bytes go, not how they are named.
     """
 
-    def __init__(self, crawler, landing_dir):
+    def __init__(self, crawler, store):
         self.crawler = crawler
-        self.landing_dir = Path(landing_dir)
-        self.written = 0
+        self.store = store
+        self.stored = 0
         self.skipped_existing = 0
-        self.write_errors = 0
+        self.errors = 0
 
     @classmethod
     def from_crawler(cls, crawler):
-        """Read the output directory from settings rather than hardcoding it."""
-        return cls(crawler, crawler.settings.get("LANDING_DIR", "data/landing"))
+        settings = crawler.settings
+        store = MinioStore(
+            endpoint=settings.get("MINIO_ENDPOINT"),
+            access_key=settings.get("MINIO_ACCESS_KEY"),
+            secret_key=settings.get("MINIO_SECRET_KEY"),
+            landing_bucket=settings.get("MINIO_LANDING_BUCKET"),
+            curated_bucket=settings.get("MINIO_CURATED_BUCKET"),
+            secure=settings.getbool("MINIO_SECURE"),
+        )
+        return cls(crawler, store)
 
     @property
     def spider(self):
         return self.crawler.spider
 
+    def open_spider(self, spider):
+        # Fail before the crawl rather than after it: an unreachable object
+        # store discovered on the first upload wastes the whole run.
+        self.store.connect()
+        spider.logger.info(
+            "MINIO: connected to %s bucket=%s",
+            self.store.endpoint,
+            self.store.landing_bucket,
+        )
+
     def process_item(self, item):
+        #item is the Scrapy item containing your data.
+        #wraps the item so you can easily access and modify it like a dictionary
         adapter = ItemAdapter(item)
         identifier = adapter.get("identifier")
 
         # Bytes are carried on the item only between the download and this
         # pipeline. They are popped here so the item stays JSON-serialisable
-        # for feed exports and, later, for MongoDB.
+        # for feed exports and for MongoDB.
         body = adapter.pop("file_bytes", None)
         if body is None:
             self.fail(item, identifier, "no_file_bytes")
@@ -52,34 +70,32 @@ class LandingFilePipeline:
         key = landing_key(
             adapter["partition_date"], adapter["body"], adapter["doc_url"]
         )
-        destination = self.landing_dir / key
 
         try:
-            # The landing zone is immutable. The object key is derived from the
-            # source URL, so an object already at this key came from the same
-            # document and is left exactly as it was first stored. Detecting a
-            # genuine content *change* is the hashing step's job, and it will
-            # record a new version rather than overwrite this one.
-            #
-            # This is also what makes re-running a range idempotent: without
-            # it, every run would rewrite every file, because these pages embed
-            # a server timing comment that differs on each request
-            # (docs/recon.md section 10).
-            if destination.exists():
-                self.skipped_existing += 1
-            else:
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(body)
-                self.written += 1
-        except OSError as exc:
+            outcome, stored_size = self.store.upload_if_absent(
+                self.store.landing_bucket,
+                key,
+                body,
+                content_type=adapter.get("content_type") or "application/octet-stream",
+            )
+        except S3Error as exc:
             # A storage failure must be counted, never silently swallowed.
-            # Letting the exception escape would drop the item while the run
-            # summary still claimed every record was accounted for.
-            self.write_errors += 1
-            self.fail(item, identifier, f"write_failed:{type(exc).__name__}", str(exc))
+            # Letting it escape would drop the record while the run summary
+            # still claimed everything was accounted for.
+            self.errors += 1
+            self.fail(item, identifier, f"minio_failed:{exc.code}", str(exc))
 
+        if outcome == "stored":
+            self.stored += 1
+        else:
+            self.skipped_existing += 1
+
+        adapter["bucket"] = self.store.landing_bucket
         adapter["file_path"] = key
-        adapter["file_size"] = len(body)
+        # The size of what is *stored*, not of what was just downloaded. On a
+        # re-run those differ, and metadata that describes bytes nobody kept
+        # is worse than useless.
+        adapter["file_size"] = stored_size
         return item
 
     def fail(self, item, identifier, reason, detail=None):
@@ -104,14 +120,17 @@ class LandingFilePipeline:
 
     def close_spider(self):
         spider = self.spider
-        message = (
-            "LANDING FILES: written=%s skipped_existing=%s write_errors=%s dir=%s"
-        )
-        args = (self.written, self.skipped_existing, self.write_errors, self.landing_dir)
         if spider is not None:
-            spider.logger.info(message, *args)
+            spider.logger.info(
+                "MINIO: stored=%s skipped_existing=%s errors=%s objects_in_bucket=%s",
+                self.stored,
+                self.skipped_existing,
+                self.errors,
+                self.store.count(self.store.landing_bucket),
+            )
+        self.store.close()
 
-
+################### MONGO PIPELINEE #######################################################################
 class MongoPipeline:
     """Store each record's metadata in MongoDB.
 
