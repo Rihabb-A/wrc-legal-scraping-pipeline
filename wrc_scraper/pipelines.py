@@ -8,6 +8,7 @@ later step is then a change to this file alone.
 from itemadapter import ItemAdapter
 from scrapy.exceptions import DropItem
 
+from common.hashing import digests
 from common.paths import landing_key
 from storage.minio import MinioStore, S3Error
 from storage.mongo import MongoStore, PyMongoError
@@ -67,8 +68,15 @@ class LandingObjectPipeline:
         if body is None:
             self.fail(item, identifier, "no_file_bytes")
 
+        fingerprints = digests(body, adapter.get("file_type"))
+        # The key carries the content hash, so identical content re-scrapes
+        # to the same key (nothing rewritten) while amended content lands
+        # beside the previous version instead of replacing it.
         key = landing_key(
-            adapter["partition_date"], adapter["body"], adapter["doc_url"]
+            adapter["partition_date"],
+            adapter["body"],
+            adapter["doc_url"],
+            fingerprints["content_hash"],
         )
 
         try:
@@ -96,6 +104,21 @@ class LandingObjectPipeline:
         # re-run those differ, and metadata that describes bytes nobody kept
         # is worse than useless.
         adapter["file_size"] = stored_size
+
+        # content_hash ignores volatile markup, so it describes the document
+        # itself and is written on every run: skipped or not, the value is
+        # the same.
+        adapter["hash_algorithm"] = fingerprints["hash_algorithm"]
+        adapter["content_hash"] = fingerprints["content_hash"]
+
+        # file_hash describes the bytes in the bucket. It is written only when
+        # those bytes were actually just stored. On a skip the object is the
+        # copy from an earlier run, so the field is left out and Mongo keeps
+        # the hash recorded then - writing this run's download would describe
+        # bytes nobody kept, the same trap as file_size.
+        if outcome == "stored":
+            adapter["file_hash"] = fingerprints["file_hash"]
+
         return item
 
     def fail(self, item, identifier, reason, detail=None):

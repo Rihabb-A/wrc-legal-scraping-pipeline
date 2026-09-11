@@ -46,16 +46,28 @@ def source_relative_path(doc_url):
     return trimmed.strip("/") or "index.html"
 
 
-def landing_key(partition_date, body, doc_url):
+def landing_key(partition_date, body, doc_url, content_hash):
     """Object key for a raw document in the landing zone.
 
-    Partition first, then body, then the source path. Leading with the
-    partition means one run's output sits under a single prefix, which makes
-    it cheap to list, re-run or delete a partition in object storage.
+    Partition first, then body, then the source path with a short content
+    hash before the extension:
 
-    '2025-07/workplace-relations-commission/2025/july/adj-00054476.html'
+    '2025-07/workplace-relations-commission/2025/july/adj-00054476.9cd39353dbad4973.html'
+
+    Leading with the partition means one run's output sits under a single
+    prefix, which makes it cheap to list, re-run or delete a partition.
+
+    Including the content hash is what lets the landing zone stay immutable
+    while still preserving amendments. Re-scraping identical content produces
+    an identical key, so nothing is rewritten; a genuinely amended document
+    produces a different key, so the new version lands beside the old one
+    instead of overwriting it.
     """
-    return f"{partition_date}/{slugify(body)}/{source_relative_path(doc_url)}"
+    relative = source_relative_path(doc_url)
+    short_hash = (content_hash or "nohash")[:16]
+    stem, dot, extension = relative.rpartition(".")
+    versioned = f"{stem}.{short_hash}.{extension}" if dot else f"{relative}.{short_hash}"
+    return f"{partition_date}/{slugify(body)}/{versioned}"
 
 
 def curated_key(partition_date, identifier, extension):

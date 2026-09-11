@@ -85,28 +85,40 @@ class MongoStore:
     def ensure_indexes(self):
         """Create the indexes the pipeline relies on. Safe to call repeatedly.
 
-        The unique index on doc_url is the database's own guarantee against
-        duplicate records: even a buggy pipeline cannot insert the same
-        document twice. Application-level checks can be bypassed; a unique
-        index cannot.
+        The unique index on (doc_url, content_hash) is the database's own
+        guarantee against duplicate records: even a buggy pipeline cannot
+        store the same version of the same document twice. Application-level
+        checks can be bypassed; a unique index cannot.
 
-        doc_url is the key rather than identifier because identifier is not
-        unique in the source - the site lists ADJ-00054476 twice under two
-        different URLs (docs/recon.md section 5).
+        doc_url is part of the key rather than identifier, because identifier
+        is not unique in the source - the site lists ADJ-00054476 twice under
+        two different URLs (docs/recon.md section 5).
+
+        content_hash is the other part so that an amended decision is kept as
+        a *new* record beside the old one rather than overwriting it. Keying
+        on doc_url alone would silently discard the previous version.
         """
         for collection in (self.landing, self.curated):
-            collection.create_index([("doc_url", ASCENDING)], unique=True, name="uniq_doc_url")
+            collection.create_index(
+                [("doc_url", ASCENDING), ("content_hash", ASCENDING)],
+                unique=True,
+                name="uniq_doc_version",
+            )
+            collection.create_index([("doc_url", ASCENDING)], name="by_doc_url")
             # Lookups by reference: how a human finds a decision.
             collection.create_index([("identifier", ASCENDING)], name="by_identifier")
             # The transformation step selects a date range, and re-runs and
             # backfills select a single partition.
             collection.create_index([("partition_date", ASCENDING)], name="by_partition")
             collection.create_index([("published_date", ASCENDING)], name="by_published_date")
+            # Change detection compares the stored content_hash against a
+            # freshly computed one.
+            collection.create_index([("content_hash", ASCENDING)], name="by_content_hash")
 
     # -- writes ---------------------------------------------------------
 
     def upsert(self, collection, record):
-        """Insert or update one metadata record, keyed on doc_url.
+        """Insert or update one metadata record, keyed on (doc_url, content_hash).
 
         Returns "inserted" or "updated". Upserting rather than inserting is
         what makes re-running a date range safe: the same document produces
@@ -122,7 +134,7 @@ class MongoStore:
         payload["last_seen_at"] = now
 
         result = collection.update_one(
-            {"doc_url": record["doc_url"]},
+            {"doc_url": record["doc_url"], "content_hash": record.get("content_hash")},
             {"$set": payload, "$setOnInsert": {"first_seen_at": now}},
             upsert=True,
         )
@@ -135,6 +147,46 @@ class MongoStore:
         return self.upsert(self.curated, record)
 
     # -- reads ----------------------------------------------------------
+
+    def known_listings(self, doc_urls, collection=None):
+        """Which (doc_url, listing_hash) pairs are already stored.
+
+        Called once per results page with that page's URLs, so deciding what
+        to skip costs one query per ten records rather than one per record.
+
+        A pair being present means we already hold the document as the
+        listing currently describes it, so it does not need downloading again.
+        """
+        collection = collection if collection is not None else self.landing
+        doc_urls = list(doc_urls)
+        if not doc_urls:
+            return set()
+        cursor = collection.find(
+            {"doc_url": {"$in": doc_urls}},
+            {"doc_url": 1, "listing_hash": 1, "_id": 0},
+        )
+        return {
+            (doc["doc_url"], doc.get("listing_hash"))
+            for doc in cursor
+            if doc.get("listing_hash")
+        }
+
+    def touch_listed(self, doc_urls, collection=None):
+        """Record that these documents were still in the search index.
+
+        Skipped documents are not re-downloaded, so last_seen_at - which
+        means "last fetched" - must not move. This records that the decision
+        was still listed, which is a different and useful fact.
+        """
+        collection = collection if collection is not None else self.landing
+        doc_urls = list(doc_urls)
+        if not doc_urls:
+            return 0
+        result = collection.update_many(
+            {"doc_url": {"$in": doc_urls}},
+            {"$set": {"last_listed_at": datetime.now(timezone.utc)}},
+        )
+        return result.modified_count
 
     def find_by_date_range(self, start_date, end_date, collection=None):
         """Metadata for every document published within an inclusive range.
