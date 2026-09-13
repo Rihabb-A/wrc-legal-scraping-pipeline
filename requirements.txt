@@ -8,3 +8,7 @@ minio
 
 # Testing
 pytest
+
+# Transformation
+beautifulsoup4
+lxml
