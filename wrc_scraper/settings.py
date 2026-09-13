@@ -1,13 +1,24 @@
-# Scrapy settings for wrc_scraper project
-#
-# For simplicity, this file contains only settings considered important or
-# commonly used. You can find more settings consulting the documentation:
-#
-#     https://docs.scrapy.org/en/latest/topics/settings.html
-#     https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
-#     https://docs.scrapy.org/en/latest/topics/spider-middleware.html
+"""Scrapy settings for the WRC pipeline.
 
-from common.config import env, env_bool
+Every tunable value is read from .env via common.config, so nothing here is
+hardcoded and behaviour can be changed without editing Python.
+
+The performance numbers are not guesses. They come from measuring the live
+site during reconnaissance (docs/recon.md section 7):
+
+    search results page   ~792 KB    2-31 s
+    decision detail page  26-80 KB   0.2-1 s
+
+    concurrency 1  ->  1.00x throughput
+    concurrency 4  ->  3.79x
+    concurrency 8  ->  7.01x       no 429s, no blocking, no slowdown
+
+Docs:
+    https://docs.scrapy.org/en/latest/topics/settings.html
+    https://docs.scrapy.org/en/latest/topics/autothrottle.html
+"""
+
+from common.config import env, env_bool, env_float, env_int
 
 BOT_NAME = "wrc_scraper"
 
@@ -16,58 +27,98 @@ NEWSPIDER_MODULE = "wrc_scraper.spiders"
 
 ADDONS = {}
 
+# ---------------------------------------------------------------------------
+# Politeness
+# ---------------------------------------------------------------------------
 
-# Crawl responsibly by identifying yourself (and your website) on the user-agent
-#USER_AGENT = "wrc_scraper (+http://www.yourdomain.com)"
+# Identify the crawler honestly. A contactable user agent means the site owner
+# can get in touch rather than silently blocking an anonymous bot.
+USER_AGENT = env(
+    "USER_AGENT",
+    "wrc-legal-scraping-pipeline (+https://github.com/; contact: webmaster@workplacerelations.ie)",
+)
 
-# Obey robots.txt rules
-ROBOTSTXT_OBEY = True
+# robots.txt disallows /en/Cases/ with a capital C, while every real link on
+# the site is lowercase /en/cases/. Robots path matching is case-sensitive, so
+# the documents are not actually disallowed - verified against Protego, the
+# parser Scrapy itself uses (docs/recon.md section 6). Obeying costs nothing
+# and is the honest default.
+ROBOTSTXT_OBEY = env_bool("ROBOTSTXT_OBEY", True)
 
-# Concurrency and throttling settings
-#CONCURRENT_REQUESTS = 16
-CONCURRENT_REQUESTS_PER_DOMAIN = 1
-DOWNLOAD_DELAY = 1
+# The site sets an ASP.NET session cookie we have no use for. Reading results
+# needs no session, so cookies are disabled: fewer moving parts, and no risk
+# of requests being coupled through shared session state.
+COOKIES_ENABLED = env_bool("COOKIES_ENABLED", False)
 
-# Disable cookies (enabled by default)
-#COOKIES_ENABLED = False
+TELNETCONSOLE_ENABLED = False
 
-# Disable Telnet Console (enabled by default)
-#TELNETCONSOLE_ENABLED = False
+# ---------------------------------------------------------------------------
+# Concurrency and throttling
+# ---------------------------------------------------------------------------
 
-# Override the default request headers:
-#DEFAULT_REQUEST_HEADERS = {
-#    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-#    "Accept-Language": "en",
-#}
+# 8 was measured, not assumed: it gives ~7x the throughput of serial fetching
+# with no 429s and no per-request slowdown. Going higher was not tested
+# against a public service that is not ours to load-test.
+CONCURRENT_REQUESTS = env_int("CONCURRENT_REQUESTS", 8)
 
-# Enable or disable spider middlewares
-# See https://docs.scrapy.org/en/latest/topics/spider-middleware.html
-#SPIDER_MIDDLEWARES = {
-#    "wrc_scraper.middlewares.WrcScraperSpiderMiddleware": 543,
-#}
+# Everything we fetch is one domain, so this must match CONCURRENT_REQUESTS or
+# it becomes the real, lower limit.
+CONCURRENT_REQUESTS_PER_DOMAIN = CONCURRENT_REQUESTS
 
-# Enable or disable downloader middlewares
-# See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html
-#DOWNLOADER_MIDDLEWARES = {
-#    "wrc_scraper.middlewares.WrcScraperDownloaderMiddleware": 543,
-#}
+# A small floor between requests. AutoThrottle raises it when the server slows
+# down; this is simply the fastest we are ever willing to go.
+DOWNLOAD_DELAY = env_float("DOWNLOAD_DELAY", 0.25)
 
-# Enable or disable extensions
-# See https://docs.scrapy.org/en/latest/topics/extensions.html
-#EXTENSIONS = {
-#    "scrapy.extensions.telnet.TelnetConsole": None,
-#}
+# Vary the delay by 0.5x-1.5x so requests do not arrive in a machine-gun
+# rhythm that is trivial to fingerprint and rate-limit.
+RANDOMIZE_DOWNLOAD_DELAY = True
 
-# Configure item pipelines
-# See https://docs.scrapy.org/en/latest/topics/item-pipeline.html
-# Order matters: files are stored first, so the metadata record can say
-# where the file actually ended up.
+# AutoThrottle watches actual response latency and widens the delay when the
+# server struggles, narrowing it when the server is comfortable. Measured
+# latency on this site ranges from 0.2s to 31s, so a fixed delay would be
+# either needlessly slow or inconsiderate depending on the hour.
+AUTOTHROTTLE_ENABLED = env_bool("AUTOTHROTTLE_ENABLED", True)
+AUTOTHROTTLE_START_DELAY = env_float("AUTOTHROTTLE_START_DELAY", 1.0)
+# Above the worst latency observed, so a slow spell throttles rather than
+# turning into a wave of timeouts.
+AUTOTHROTTLE_MAX_DELAY = env_float("AUTOTHROTTLE_MAX_DELAY", 30.0)
+AUTOTHROTTLE_TARGET_CONCURRENCY = env_float(
+    "AUTOTHROTTLE_TARGET_CONCURRENCY", float(CONCURRENT_REQUESTS)
+)
+AUTOTHROTTLE_DEBUG = env_bool("AUTOTHROTTLE_DEBUG", False)
+
+# ---------------------------------------------------------------------------
+# Timeouts and retries
+# ---------------------------------------------------------------------------
+
+# Generous on purpose. Search pages were measured taking up to 31 seconds, so
+# a typical 30s timeout would manufacture failures out of healthy responses.
+DOWNLOAD_TIMEOUT = env_int("DOWNLOAD_TIMEOUT", 90)
+
+RETRY_ENABLED = True
+RETRY_TIMES = env_int("RETRY_TIMES", 3)
+
+# Retry only what is plausibly transient. Scrapy's default list is kept
+# deliberately: 5xx are server hiccups, 408 and 429 are explicit "try later"
+# signals. 404 is absent on purpose - a missing document will still be missing
+# on the fourth attempt, so retrying it only wastes the site's capacity.
+RETRY_HTTP_CODES = [500, 502, 503, 504, 522, 524, 408, 429]
+
+# ---------------------------------------------------------------------------
+# Pipelines
+# ---------------------------------------------------------------------------
+
+# Order matters: the file is stored first so the metadata record can say where
+# it actually ended up, and with which hash.
 ITEM_PIPELINES = {
     "wrc_scraper.pipelines.LandingObjectPipeline": 300,
     "wrc_scraper.pipelines.MongoPipeline": 400,
 }
 
-# --- MinIO object storage, from .env ---
+# ---------------------------------------------------------------------------
+# Storage, all from .env
+# ---------------------------------------------------------------------------
+
 MINIO_ENDPOINT = env("MINIO_ENDPOINT", "localhost:9000")
 MINIO_ACCESS_KEY = env("MINIO_ACCESS_KEY", "minioadmin")
 MINIO_SECRET_KEY = env("MINIO_SECRET_KEY", "minioadmin")
@@ -75,32 +126,19 @@ MINIO_SECURE = env_bool("MINIO_SECURE", False)
 MINIO_LANDING_BUCKET = env("MINIO_LANDING_BUCKET", "wrc-landing")
 MINIO_CURATED_BUCKET = env("MINIO_CURATED_BUCKET", "wrc-curated")
 
-# --- MongoDB, from .env so nothing here is hardcoded ---
 MONGO_URI = env("MONGO_URI", "mongodb://localhost:27017")
 MONGO_DB = env("MONGO_DB", "wrc")
 MONGO_LANDING_COLLECTION = env("MONGO_LANDING_COLLECTION", "landing_documents")
 MONGO_CURATED_COLLECTION = env("MONGO_CURATED_COLLECTION", "curated_documents")
 
-# Enable and configure the AutoThrottle extension (disabled by default)
-# See https://docs.scrapy.org/en/latest/topics/autothrottle.html
-#AUTOTHROTTLE_ENABLED = True
-# The initial download delay
-#AUTOTHROTTLE_START_DELAY = 5
-# The maximum download delay to be set in case of high latencies
-#AUTOTHROTTLE_MAX_DELAY = 60
-# The average number of requests Scrapy should be sending in parallel to
-# each remote server
-#AUTOTHROTTLE_TARGET_CONCURRENCY = 1.0
-# Enable showing throttling stats for every response received:
-#AUTOTHROTTLE_DEBUG = False
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-# Enable and configure HTTP caching (disabled by default)
-# See https://docs.scrapy.org/en/latest/topics/downloader-middleware.html#httpcache-middleware-settings
-#HTTPCACHE_ENABLED = True
-#HTTPCACHE_EXPIRATION_SECS = 0
-#HTTPCACHE_DIR = "httpcache"
-#HTTPCACHE_IGNORE_HTTP_CODES = []
-#HTTPCACHE_STORAGE = "scrapy.extensions.httpcache.FilesystemCacheStorage"
+LOG_LEVEL = env("LOG_LEVEL", "INFO")
 
-# Set settings whose default value is deprecated to a future-proof value
+# Machine-readable run log: one JSON object per line, written alongside the
+# human-readable console output. Configured in common/logging_config.py.
+EVENT_LOG_FILE = env("LOG_FILE", "structured_log.jsonl")
+
 FEED_EXPORT_ENCODING = "utf-8"

@@ -12,14 +12,19 @@ Later steps add document downloads and storage.
 """
 
 import math
+import time
 from datetime import datetime
 
 import scrapy
+from scrapy.downloadermiddlewares.retry import get_retry_request
 from scrapy.spidermiddlewares.httperror import HttpError
 from w3lib.url import add_or_replace_parameter
 
 from common.filetypes import UNKNOWN, detect_file_type, is_binary
+from common.hashing import listing_digest
+from common.logging_config import EventLog
 from common.partitioning import MONTHLY, generate_partitions
+from storage.mongo import MongoStore
 from wrc_scraper.constants import (
     NO_RESULTS_TEXT,
     PAGE_SIZE,
@@ -42,6 +47,7 @@ class DecisionsSpider(scrapy.Spider):
         end_date=None,
         partition_size=MONTHLY,
         bodies=None,
+        refresh=False,
         *args,
         **kwargs,
     ):
@@ -67,8 +73,18 @@ class DecisionsSpider(scrapy.Spider):
         # Reconciliation is tracked per slice - one partition, one body - so a
         # shortfall can be traced to the exact search that lost records,
         # instead of only showing up as a wrong grand total.
+        # -a refresh=true re-downloads everything, ignoring what is already
+        # stored. Useful after changing how documents are parsed.
+        self.refresh = str(refresh).strip().lower() in {"1", "true", "yes", "on"}
         self.slice_stats = {}
         self.failures = []
+        # Documents skipped this run, so their "still listed" timestamp can
+        # be refreshed in one bulk write at the end.
+        self.skipped_urls = []
+        # Both set by from_crawler; None when built directly in tests.
+        self.store = None
+        self.events = None
+        self.started_at = time.monotonic()
 
         self.logger.info(
             "Run covers %s partitions x %s bodies = %s searches (%s..%s)",
@@ -78,6 +94,32 @@ class DecisionsSpider(scrapy.Spider):
             self.partitions[0].start.isoformat(),
             self.partitions[-1].end.isoformat(),
         )
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        """Attach a MongoDB connection used to decide what can be skipped.
+
+        Connecting here means an unreachable database stops the run before
+        any page is fetched.
+        """
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        settings = crawler.settings
+        spider.events = EventLog(settings.get("EVENT_LOG_FILE", "structured_log.jsonl"))
+        spider.events.emit(
+            "run_started",
+            start_date=spider.partitions[0].start.isoformat(),
+            end_date=spider.partitions[-1].end.isoformat(),
+            partitions=len(spider.partitions),
+            bodies=list(spider.bodies),
+            partition_size=spider.partitions[0].partition_date,
+            refresh=spider.refresh,
+        )
+        spider.store = MongoStore(
+            uri=settings.get("MONGO_URI"),
+            database=settings.get("MONGO_DB"),
+            landing_collection=settings.get("MONGO_LANDING_COLLECTION"),
+            curated_collection=settings.get("MONGO_CURATED_COLLECTION"),
+        ).connect()
+        return spider
 
     async def start(self):
         """Issue the first search page for every partition/body combination.
@@ -88,6 +130,14 @@ class DecisionsSpider(scrapy.Spider):
         """
         for partition in self.partitions:
             for body_name, body_id in self.bodies.items():
+                if self.events is not None:
+                    self.events.emit(
+                        "partition_started",
+                        partition_date=partition.partition_date,
+                        body=body_name,
+                        start=partition.start.isoformat(),
+                        end=partition.end.isoformat(),
+                    )
                 yield scrapy.Request(
                     build_search_url(body_id, partition.start, partition.end),
                     callback=self.parse,
@@ -113,9 +163,17 @@ class DecisionsSpider(scrapy.Spider):
         searchhead = response.css("div.searchhead::text").get()
 
         if searchhead is None:
-            # Not "zero results" - the request was malformed or the response
-            # is broken. Record it so the end-of-run summary cannot silently
-            # under-report.
+            # Not "zero results" - the response is broken or truncated. This
+            # site answers 200 to everything, so Scrapy's retry middleware
+            # never sees a failure here and the request must be retried by
+            # hand. get_retry_request returns None once RETRY_TIMES is spent,
+            # at which point the loss is recorded rather than hidden.
+            retry = get_retry_request(
+                response.request, spider=self, reason="missing_searchhead"
+            )
+            if retry is not None:
+                yield retry
+                return
             self.record_failure(response.url, partition_date, body, "missing_searchhead")
             return
 
@@ -139,21 +197,49 @@ class DecisionsSpider(scrapy.Spider):
         cards = response.css("li.each-item")
 
         if not cards:
+            # The page claims results but carries none: another broken 200.
+            retry = get_retry_request(
+                response.request, spider=self, reason="no_cards_but_reported"
+            )
+            if retry is not None:
+                yield retry
+                return
             self.record_failure(
                 response.url, partition_date, body, f"no_cards_but_reported_{total}"
             )
             return
 
-        for card in cards:
-            record = self.parse_card(card, response, partition_date, body)
-            stats["listed"] += 1
+        records = [
+            self.parse_card(card, response, partition_date, body) for card in cards
+        ]
+        stats["listed"] += len(records)
 
+        # One query for the whole page rather than one per record: which of
+        # these documents do we already hold exactly as the listing now
+        # describes them? The server sends no ETag or Last-Modified and
+        # ignores conditional requests, so the listing row is the only
+        # change signal available without downloading the document itself.
+        already_held = set()
+        if not self.refresh and self.store is not None:
+            already_held = self.store.known_listings(
+                [r["doc_url"] for r in records if r["doc_url"]]
+            )
+
+        for record in records:
             if not record["doc_url"]:
                 stats["failed"] += 1
                 self.record_failure(
                     response.url, partition_date, body, "no_doc_url",
                     identifier=record["identifier"],
                 )
+                continue
+
+            record["listing_hash"] = listing_digest(record)
+
+            if (record["doc_url"], record["listing_hash"]) in already_held:
+                # Unchanged since the last run: do not download it again.
+                stats["unchanged"] += 1
+                self.skipped_urls.append(record["doc_url"])
                 continue
 
             yield response.follow(
@@ -177,6 +263,14 @@ class DecisionsSpider(scrapy.Spider):
         # known - and search pages take 2-30s each (docs/recon.md §7).
         stats["found"] = total
         last_page = math.ceil(total / PAGE_SIZE)
+        if self.events is not None:
+            self.events.emit(
+                "records_found",
+                partition_date=partition_date,
+                body=body,
+                found=total,
+                pages=last_page,
+            )
         self.logger.info(
             "partition=%s body=%s found=%s pages=%s",
             partition_date,
@@ -200,12 +294,20 @@ class DecisionsSpider(scrapy.Spider):
     def new_stats():
         """Counters for one partition/body slice.
 
-        found    - what the site says exists
-        listed   - result cards we parsed out of the listing
-        downloaded - documents actually retrieved
-        failed   - documents we could not retrieve, each logged with a reason
+        found      - what the site says exists
+        listed     - result cards we parsed out of the listing
+        downloaded - documents actually retrieved and stored
+        unchanged  - already held, so deliberately not downloaded again
+        failed     - documents we could not retrieve, each logged with a reason
         """
-        return {"found": 0, "listed": 0, "downloaded": 0, "failed": 0, "pages": 0}
+        return {
+            "found": 0,
+            "listed": 0,
+            "downloaded": 0,
+            "unchanged": 0,
+            "failed": 0,
+            "pages": 0,
+        }
 
     def parse_document(self, response, record):
         """Handle the decision document itself.
@@ -289,48 +391,90 @@ class DecisionsSpider(scrapy.Spider):
             status_code,
             url,
         )
-        self.failures.append(
-            {
-                "url": url,
-                "partition_date": partition_date,
-                "body": body,
-                "identifier": identifier,
-                "reason": reason,
-                "status_code": status_code,
-            }
-        )
+        failure = {
+            "url": url,
+            "partition_date": partition_date,
+            "body": body,
+            "identifier": identifier,
+            "reason": reason,
+            "status_code": status_code,
+        }
+        self.failures.append(failure)
+        if self.events is not None:
+            self.events.error("download_failed", **failure)
 
     def closed(self, reason):
         """Log the end-of-run reconciliation summary."""
+        # Refresh the "still listed" timestamp for everything skipped, in
+        # one write rather than one per document.
+        if self.store is not None and self.skipped_urls:
+            self.store.touch_listed(self.skipped_urls)
+
         totals = {
             key: sum(s[key] for s in self.slice_stats.values())
-            for key in ("found", "listed", "downloaded", "failed")
+            for key in ("found", "listed", "downloaded", "unchanged", "failed")
         }
 
         # The run is only fully accounted for when every record the site
-        # reported was either downloaded or explicitly failed.
-        unaccounted = totals["found"] - totals["downloaded"] - totals["failed"]
+        # reported was downloaded, deliberately skipped as unchanged, or
+        # explicitly failed with a reason.
+        unaccounted = (
+            totals["found"]
+            - totals["downloaded"]
+            - totals["unchanged"]
+            - totals["failed"]
+        )
 
         # Any slice that does not add up is named, so a shortfall points at
         # the exact search that caused it rather than only a wrong total.
         mismatched = {
             f"{partition_date}/{body}": stats
             for (partition_date, body), stats in sorted(self.slice_stats.items())
-            if stats["found"] != stats["downloaded"] + stats["failed"]
+            if stats["found"]
+            != stats["downloaded"] + stats["unchanged"] + stats["failed"]
         }
 
         self.logger.info(
-            "RUN SUMMARY: found=%s listed=%s downloaded=%s failed=%s "
-            "unaccounted=%s slices=%s mismatched=%s reason=%s",
+            "RUN SUMMARY: found=%s listed=%s downloaded=%s unchanged=%s "
+            "failed=%s unaccounted=%s slices=%s mismatched=%s reason=%s",
             totals["found"],
             totals["listed"],
             totals["downloaded"],
+            totals["unchanged"],
             totals["failed"],
             unaccounted,
             len(self.slice_stats),
             mismatched or "none",
             reason,
         )
+
+        if self.events is not None:
+            # One event per partition/body, so a shortfall can be traced to
+            # the exact search that caused it.
+            for (partition_date, slice_body), slice_stats in sorted(
+                self.slice_stats.items()
+            ):
+                self.events.emit(
+                    "partition_completed",
+                    partition_date=partition_date,
+                    body=slice_body,
+                    **slice_stats,
+                )
+
+            self.events.emit(
+                "run_summary",
+                duration_seconds=round(time.monotonic() - self.started_at, 2),
+                finish_reason=reason,
+                slices=len(self.slice_stats),
+                failures=len(self.failures),
+                mismatched_slices=list(mismatched),
+                unaccounted=unaccounted,
+                **totals,
+            )
+            self.events.close()
+
+        if self.store is not None:
+            self.store.close()
 
     def parse_card(self, card, response, partition_date, body):
         """Turn one ``li.each-item`` result into a metadata dict.
