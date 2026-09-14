@@ -98,12 +98,23 @@ class MongoStore:
         a *new* record beside the old one rather than overwriting it. Keying
         on doc_url alone would silently discard the previous version.
         """
+        # Landing is keyed by source URL and content, so every version of a
+        # document is kept. Curated is keyed by its own file path, because a
+        # curated file is named identifier.ext and there is exactly one per
+        # identifier per partition.
+        self.landing.create_index(
+            [("doc_url", ASCENDING), ("content_hash", ASCENDING)],
+            unique=True,
+            name="uniq_doc_version",
+        )
+        self.curated.create_index(
+            [("file_path", ASCENDING)], unique=True, name="uniq_curated_path"
+        )
+        self.curated.create_index(
+            [("source_doc_url", ASCENDING)], name="by_source_doc_url"
+        )
+
         for collection in (self.landing, self.curated):
-            collection.create_index(
-                [("doc_url", ASCENDING), ("content_hash", ASCENDING)],
-                unique=True,
-                name="uniq_doc_version",
-            )
             collection.create_index([("doc_url", ASCENDING)], name="by_doc_url")
             # Lookups by reference: how a human finds a decision.
             collection.create_index([("identifier", ASCENDING)], name="by_identifier")
@@ -116,6 +127,19 @@ class MongoStore:
             collection.create_index([("content_hash", ASCENDING)], name="by_content_hash")
 
     # -- writes ---------------------------------------------------------
+
+    def upsert_by(self, collection, key, record):
+        """Insert or update one record, matched on an arbitrary key.
+
+        Returns "inserted" or "updated".
+        """
+        now = datetime.now(timezone.utc)
+        payload = {k: v for k, v in record.items() if k not in _INSERT_ONLY}
+        payload["last_seen_at"] = now
+        result = collection.update_one(
+            key, {"$set": payload, "$setOnInsert": {"first_seen_at": now}}, upsert=True
+        )
+        return "inserted" if result.upserted_id is not None else "updated"
 
     def upsert(self, collection, record):
         """Insert or update one metadata record, keyed on (doc_url, content_hash).
@@ -144,7 +168,20 @@ class MongoStore:
         return self.upsert(self.landing, record)
 
     def upsert_curated(self, record):
-        return self.upsert(self.curated, record)
+        """Insert or update a curated record, keyed on its curated file path."""
+        return self.upsert_by(self.curated, {"file_path": record["file_path"]}, record)
+
+    def curated_by_paths(self, file_paths):
+        """Existing curated records for these keys, as {file_path: record}.
+
+        Fetched a batch at a time so deciding what to skip costs one query per
+        batch rather than one per document.
+        """
+        file_paths = list(file_paths)
+        if not file_paths:
+            return {}
+        cursor = self.curated.find({"file_path": {"$in": file_paths}})
+        return {doc["file_path"]: doc for doc in cursor}
 
     # -- reads ----------------------------------------------------------
 
