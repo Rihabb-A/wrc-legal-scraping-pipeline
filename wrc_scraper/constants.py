@@ -37,6 +37,24 @@ SITE_DATE_FORMAT = "%d/%m/%Y"
 #: renders it with newlines and doubled spaces, so collapse whitespace first.
 RESULT_COUNT_RE = re.compile(r"Shows\s+\d+\s+to\s+\d+\s+of\s+(\d+)\s+results")
 
+#: Dash-like characters that appear in identifiers where an ASCII hyphen is
+#: meant, mapped to the hyphen.
+#:
+#: An evaluation run over 994 decisions found four identifiers using an EN
+#: DASH: "IR-SC\u201300002726" rather than "IR-SC-00002726". They look
+#: identical and are not: a lookup by identifier misses them, and the curated
+#: filename ends up carrying a non-ASCII character. The site is inconsistent
+#: with itself here - every other IR-SC reference uses a plain hyphen.
+DASH_CHARACTERS = {
+    "\u2010": "-",  # hyphen
+    "\u2011": "-",  # non-breaking hyphen
+    "\u2012": "-",  # figure dash
+    "\u2013": "-",  # en dash
+    "\u2014": "-",  # em dash
+    "\u2015": "-",  # horizontal bar
+    "\u2212": "-",  # minus sign
+}
+
 #: Shown when a search legitimately matches nothing, and also when pageNumber
 #: runs past the last page. Quite different from div.searchhead being absent,
 #: which means the request itself was malformed.

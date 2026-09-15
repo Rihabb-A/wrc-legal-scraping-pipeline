@@ -26,6 +26,7 @@ from common.logging_config import EventLog
 from common.partitioning import MONTHLY, generate_partitions
 from storage.mongo import MongoStore
 from wrc_scraper.constants import (
+    DASH_CHARACTERS,
     NO_RESULTS_TEXT,
     PAGE_SIZE,
     RESULT_COUNT_RE,
@@ -510,14 +511,25 @@ class DecisionsSpider(scrapy.Spider):
 
     @staticmethod
     def clean_identifier(value):
-        """Strip *all* whitespace from an identifier.
+        """Normalise an identifier to its canonical, ASCII form.
 
-        Some references are rendered with spaces around the hyphens, e.g.
-        "IR - SC - 00001595". Removing whitespace yields "IR-SC-00001595",
-        which is the form used in the document URL and in curated filenames.
+        Two inconsistencies in the source are corrected here:
+
+        * spaces around the hyphens, e.g. "IR - SC - 00001595", which become
+          "IR-SC-00001595" - the form used in the document URL and in curated
+          filenames
+        * Unicode dashes where a hyphen is meant, e.g. an EN DASH in
+          "IR-SC\u201300002726", found in four of 994 decisions
+
+        Both matter because the identifier is how a human looks a decision up
+        and what the curated file is named. Two spellings of one reference
+        would mean lookups quietly missing documents.
         """
         if value is None:
             return None
+        for dash, replacement in DASH_CHARACTERS.items():
+            if dash in value:
+                value = value.replace(dash, replacement)
         return "".join(value.split()) or None
 
     #31/07/2025 -> parse_date() -> 2025-07-31

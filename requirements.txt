@@ -12,3 +12,7 @@ pytest
 # Transformation
 beautifulsoup4
 lxml
+
+# Orchestration
+dagster
+dagster-webserver

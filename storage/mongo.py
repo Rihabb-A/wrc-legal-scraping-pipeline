@@ -9,14 +9,32 @@ where the file lives and what it hashes to. The file itself lives in object
 storage, because a database row is the wrong place for a 30 KB blob.
 """
 
+import time
 from datetime import datetime, timezone
 
 from pymongo import ASCENDING, MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 #: Fields never overwritten on a re-run: they record the first time we saw
 #: this document, which later runs must not rewrite.
 _INSERT_ONLY = ("first_seen_at",)
+
+#: Attempts for a single write before giving up.
+#:
+#: MongoDB retries writes itself only against a replica set; a standalone
+#: server, which is what docker-compose runs, does not support retryable
+#: writes, so the application has to do it.
+#:
+#: This is safe precisely because every write here is an idempotent upsert
+#: keyed on the document's own identity: repeating one either applies it or
+#: finds it already applied. An evaluation run of 994 documents produced one
+#: _OperationCancelled whose write had in fact already been applied
+#: server-side, so the record was reported as failed while being perfectly
+#: intact - a retry turns that into an accurate success.
+WRITE_ATTEMPTS = 3
+
+#: Seconds to wait after a failed attempt, doubling each time.
+WRITE_RETRY_BACKOFF = 0.5
 
 
 class MongoStore:
@@ -136,10 +154,33 @@ class MongoStore:
         now = datetime.now(timezone.utc)
         payload = {k: v for k, v in record.items() if k not in _INSERT_ONLY}
         payload["last_seen_at"] = now
-        result = collection.update_one(
-            key, {"$set": payload, "$setOnInsert": {"first_seen_at": now}}, upsert=True
-        )
+        update = {"$set": payload, "$setOnInsert": {"first_seen_at": now}}
+
+        result = self._write_with_retry(collection.update_one, key, update, upsert=True)
         return "inserted" if result.upserted_id is not None else "updated"
+
+    @staticmethod
+    def _write_with_retry(operation, *args, **kwargs):
+        """Run a write, retrying transient failures.
+
+        Raises:
+            PyMongoError: If every attempt fails, so the caller still counts
+                the record as lost rather than assuming success.
+        """
+        delay = WRITE_RETRY_BACKOFF
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            try:
+                return operation(*args, **kwargs)
+            except DuplicateKeyError:
+                # A unique index rejected this write. Repeating it would be
+                # rejected identically, so this is a real conflict, not a
+                # transient fault.
+                raise
+            except PyMongoError:
+                if attempt == WRITE_ATTEMPTS:
+                    raise
+                time.sleep(delay)
+                delay *= 2
 
     def upsert(self, collection, record):
         """Insert or update one metadata record, keyed on (doc_url, content_hash).
