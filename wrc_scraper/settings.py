@@ -31,12 +31,10 @@ ADDONS = {}
 # Politeness
 # ---------------------------------------------------------------------------
 
-# Identify the crawler honestly. A contactable user agent means the site owner
-# can get in touch rather than silently blocking an anonymous bot.
-USER_AGENT = env(
-    "USER_AGENT",
-    "wrc-legal-scraping-pipeline (+https://github.com/; contact: webmaster@workplacerelations.ie)",
-)
+# Identify the crawler honestly rather than impersonating a browser. Set
+# USER_AGENT in .env to add a real contact address for a deployment, so the
+# site owner can get in touch instead of silently blocking an anonymous bot.
+USER_AGENT = env("USER_AGENT", "WRC-Legal-Pipeline/1.0")
 
 # robots.txt disallows /en/Cases/ with a capital C, while every real link on
 # the site is lowercase /en/cases/. Robots path matching is case-sensitive, so

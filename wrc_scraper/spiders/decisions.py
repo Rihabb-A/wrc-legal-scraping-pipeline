@@ -20,6 +20,7 @@ from scrapy.downloadermiddlewares.retry import get_retry_request
 from scrapy.spidermiddlewares.httperror import HttpError
 from w3lib.url import add_or_replace_parameter
 
+from common.config import env
 from common.filetypes import UNKNOWN, detect_file_type, is_binary
 from common.hashing import listing_digest
 from common.logging_config import EventLog
@@ -46,7 +47,7 @@ class DecisionsSpider(scrapy.Spider):
         self,
         start_date=None,
         end_date=None,
-        partition_size=MONTHLY,
+        partition_size=None,
         bodies=None,
         refresh=False,
         *args,
@@ -65,6 +66,10 @@ class DecisionsSpider(scrapy.Spider):
                 "start_date and end_date are required, e.g. "
                 "scrapy crawl decisions -a start_date=2025-07-01 -a end_date=2025-07-31"
             )
+
+        # Partition size resolves in three steps: an explicit -a argument
+        # wins, then PARTITION_SIZE from .env, then the monthly default.
+        partition_size = partition_size or env("PARTITION_SIZE", MONTHLY)
 
         # Both of these raise on bad input rather than quietly producing an
         # empty run that would look like a success.

@@ -23,7 +23,8 @@ WEEKLY = "weekly"
 MONTHLY = "monthly"
 YEARLY = "yearly"
 
-#: Supported partition sizes. Configurable via PARTITION_SIZE in .env.
+#: Supported partition sizes. The spider resolves which one to use from
+#: its -a partition_size argument, else PARTITION_SIZE in .env, else monthly.
 PARTITION_SIZES = (DAILY, WEEKLY, MONTHLY, YEARLY)
 
 

@@ -7,8 +7,6 @@ transforms them into a curated layer. Ingestion and transformation run as
 separate Dagster ops with a real dependency between them.
 
 Design decisions and their reasoning are in [ARCHITECTURE.md](ARCHITECTURE.md).
-The evidence they are based on — measured against the live site — is in
-[docs/recon.md](docs/recon.md).
 
 ```
                   ┌──────────────────────────────────────────┐
@@ -259,28 +257,7 @@ explicitly failed with a logged reason.
 
 ---
 
-## 6. Running the tests
-
-```powershell
-pytest                    # 147 tests
-pytest -v                 # with names
-pytest tests/test_partitioning.py
-```
-
-No network and no containers are required. The tests run against real pages
-saved under `tests/fixtures/`, so they give the same answer whether or not
-workplacerelations.ie is reachable.
-
-| File | Covers |
-|---|---|
-| `test_partitioning.py` | Date ranges split with no gaps and no overlaps |
-| `test_hashing.py` | SHA-256 vectors, and that an unchanged page compares as unchanged |
-| `test_html_cleaning.py` | Site furniture removed, legal text and tables kept |
-| `test_spider_parsing.py` | Selectors, normalisation, pagination, argument validation |
-
----
-
-## 7. Verifying idempotency
+## 6. Verifying idempotency
 
 Run the same range twice and compare:
 
@@ -316,7 +293,6 @@ published decisions are discovered.
 | `transform/transform.py` | Landing → Curated |
 | `orchestration/definitions.py` | Dagster job |
 | `docker-compose.yml` | MongoDB + MinIO |
-| `docs/recon.md` | Measured findings about the site |
 
 ---
 

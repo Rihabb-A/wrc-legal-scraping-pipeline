@@ -21,6 +21,7 @@ sample.json
 
 # Dagster local state
 tmp*/
+.tmp_dagster_home*/
 dagster_home/
 
 # Playwright MCP scratch output from website reconnaissance

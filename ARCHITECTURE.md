@@ -1,110 +1,79 @@
 # Architecture
 
-## Pipeline
-
 ```
-INGESTION                              TRANSFORMATION
-  |                                       |
-Scrapy searches workplacerelations.ie   Reads Landing Zone (Mongo + MinIO)
-  |                                       |
-Landing Zone (raw, immutable)     -->   Curated Zone (cleaned, renamed)
-  MongoDB: landing_documents             MongoDB: curated_documents
-  MinIO:   wrc-landing                   MinIO:   wrc-curated
+INGESTION  (scrapy crawl decisions)        TRANSFORMATION  (transform.transform)
+  Landing Zone - raw, immutable       -->    Curated Zone - cleaned, renamed
+  MongoDB landing_documents                  MongoDB curated_documents
+  MinIO   wrc-landing                        MinIO   wrc-curated
 ```
 
-Dagster (`orchestration/definitions.py`) runs these as two ops in one job,
+Dagster (`orchestration/definitions.py`) runs these as two ops,
 `ingest_decisions >> transform_decisions`. Transformation never starts if
 ingestion raised, crashed, or left records unaccounted for.
 
 ## 1. Why monthly partitions?
 
 A partition is one search of one body over one slice of time
-(`common/partitioning.py`). Monthly is the default because:
-
-- It is small enough that a failure costs one slice, not the whole range - a
-  bad month can be re-run in isolation.
-- It is large enough to avoid per-day orchestration overhead for a range that
-  can span years.
-- It matches the site's own date filter and lines up with `partition_date`,
-  which is stored on every record and used to lay out object-storage paths
-  (`wrc-landing/<partition_date>/...`).
-
-Every partition/body combination is scheduled independently at spider start,
-so slices execute concurrently and one slow or failing search does not block
-the others.
+(`common/partitioning.py`). Monthly is small enough that a failure costs one
+slice rather than the whole range, and large enough to avoid per-day
+orchestration overhead across multi-year ranges. It also matches the site's
+own date filter and gives `partition_date`, which is stored on every record
+and prefixes every object key. Both ends are inclusive and the next partition
+starts the following day, so there are no gaps and no overlaps. Every
+partition/body combination is scheduled independently at spider start, so
+slices run concurrently and one slow search does not block the others.
+`PARTITION_SIZE` in `.env` (or `-a partition_size=`) switches to daily,
+weekly or yearly without a code change.
 
 ## 2. Retries and rate limiting
 
-The site returns HTTP 200 even for broken responses (empty or truncated
-search pages), so a 200 status proves nothing. Two layers of retry exist:
+The site answers HTTP 200 even for broken responses, so a status code proves
+nothing. Two layers therefore exist: Scrapy's `RetryMiddleware` for transport
+failures and 5xx/408/429, and a manual `get_retry_request` in `parse()` for
+the 200-but-broken case — a missing `div.searchhead`, or a page claiming
+results while carrying no cards. Once retries are exhausted the loss is
+recorded as a failure rather than dropped. 404 is deliberately not retried:
+a missing document stays missing.
 
-- **Scrapy's `RetryMiddleware`**, for transient transport failures (timeouts,
-  connection resets, 5xx).
-- **A manual retry via `get_retry_request`** in `parse()`, for the
-  200-but-broken case: a missing `div.searchhead` or a page that claims
-  results but carries no `li.each-item` cards. Once retries are exhausted the
-  loss is recorded as a failure rather than silently dropped.
+Concurrency is 8, measured rather than guessed (≈7× serial throughput, no
+429s), paired with AutoThrottle, a randomised delay and a 90s timeout, since
+search pages were observed taking up to 31 seconds. All are `.env` settings.
 
-Concurrency and pacing come from Scrapy's `AUTOTHROTTLE_*` and
-`DOWNLOAD_DELAY` settings, configurable via environment variables rather than
-hardcoded, so the crawl can be slowed down or sped up without a code change.
+## 3. Deduplication and idempotency
 
-## 3. Deduplication strategy
+Two properties of the source rule out the obvious keys. **`identifier` is not
+unique** — the site lists the same decision under two URLs. **Raw bytes are
+not stable** — every response carries a server timing comment, so the same
+page hashes differently on every fetch.
 
-Two properties of the source ruled out the obvious keys:
+So each record carries two hashes (`common/hashing.py`): `file_hash` over the
+exact stored bytes, and `content_hash` over the content with that volatile
+markup removed. Ingestion's key is **`(doc_url, content_hash)`**, enforced by
+a unique index: `doc_url` keeps genuinely distinct sources apart, while
+`content_hash` recognises an unchanged document. A third, cheaper
+`listing_digest` of the search-result row lets the spider skip a document
+without downloading it at all — a repeat run of 994 documents dropped from
+1,110 HTTP requests to 112.
 
-- **`identifier` is not unique.** July 2025 lists `ADJ-00054476` twice, under
-  two different URLs, with slightly different bytes.
-- **Raw bytes are not stable.** The same page returns a different SHA-256 on
-  every fetch, because of a server-side timing comment
-  (`<!-- Elapsed time: ... -->`). Hashing raw bytes would mark every document
-  changed on every run.
-
-So every document carries **two hashes** (`common/hashing.py`):
-
-| Field | Hashes | Answers |
-|---|---|---|
-| `file_hash` | exact stored bytes | is the stored object intact? |
-| `content_hash` | HTML with comments stripped (binaries: raw bytes) | did the content actually change? |
-
-Ingestion's idempotency key is **`(doc_url, content_hash)`** - `doc_url` is
-unique by construction, so the two `ADJ-00054476` copies stay separate
-Landing objects instead of one overwriting the other; `content_hash` ignores
-the volatile comment, so an unchanged document compares equal on the next
-run. Before even downloading a document, the spider also checks a cheap
-`listing_digest` of the search-result row (`identifier`, `title`,
-`description`, `published_date`, `doc_url`) to skip documents that have not
-moved since the last run without fetching them at all.
-
-The transformation stage re-derives its own `content_hash` from the cleaned
-**text**, not the cleaned markup, because the two `ADJ-00054476` sources
-clean to markup that differs by one empty tag while the legal text is
-identical - and both must produce a single curated file.
-
-`identifier` is still stored and indexed for humans to look decisions up by,
-it is simply not the uniqueness key. The Landing Zone is never overwritten:
-changed content produces a new stored object, not an in-place edit.
+Transformation re-derives `content_hash` from the cleaned **text**, because
+the duplicate pair cleans to markup differing by one empty tag while the legal
+text is identical — and both must yield a single curated file, with the second
+URL recorded in `also_sourced_from`. Differing text refuses to overwrite and
+is logged as a conflict. The Landing Zone is never modified: changed content
+becomes a new object, never an in-place edit.
 
 ## 4. Scaling to 50+ sources
 
-What is source-specific today (`wrc_scraper/spiders/decisions.py`, the body
-IDs in `wrc_scraper/constants.py`, `transform/html_cleaner.py`'s selectors)
-would become one spider and one cleaner per source, each following the same
-shape. What is already shared and would not need to change:
+Source-specific today: the spider, the body IDs in `constants.py`, and the
+cleaner's selectors — these become one spider and one cleaner per source.
+Already shared and unchanged: `common/` (partitioning, hashing, logging),
+`storage/` (Mongo, MinIO), the Landing/Curated split, the two-hash idempotency
+model, and the Dagster dependency.
 
-- `common/partitioning.py`, `common/hashing.py`, `common/logging_config.py`
-- `storage/mongo.py`, `storage/minio.py`
-- the Landing/Curated split and the two-hash idempotency model
-- `orchestration/definitions.py`'s ingest-then-transform dependency
-
-Records would gain a `source` field alongside `partition_date`, so
-`(source, partition_date, body)` becomes the unit of work instead of just
-`(partition_date, body)` - the pattern in `orchestration/definitions.py`
-already accepts arbitrary start/end dates and bodies per run, so extending it
-to iterate over a source registry is additive, not a rewrite. At larger
-volume, MinIO already speaks the S3 API, so moving to real S3 is a
-configuration change (`MINIO_ENDPOINT`), not a code change; MongoDB would
-need sharding or indexes revisited once collections grow past a single
-node's comfort. Structured JSON logs already carry per-slice reconciliation,
-which is what alerting on `unaccounted > 0` across many sources would build
-on directly.
+Records would gain a `source` field, making `(source, partition_date, body)`
+the unit of work; the ops already accept arbitrary dates and bodies per run,
+so iterating a source registry is additive. MinIO already speaks S3, so
+production storage is a config change. MongoDB would need its indexes
+revisited and eventually sharding. The structured logs already carry per-slice
+reconciliation, so alerting on `unaccounted > 0` across many sources builds
+directly on what exists.
